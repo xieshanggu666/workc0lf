@@ -35,6 +35,9 @@ class GameSession(Base):
     pending_crisis = Column(JSON, nullable=True)
     # 最近一次危机结算的幂等凭据，重复/并发落败请求据此安全回放，不再二次结算
     last_resolution = Column(JSON, nullable=True)
+    # 外出探索队完整快照；None 表示无人离堡。遭遇、补给、战利品与一次性
+    # 动作凭据都随档案落库，刷新后恢复同一场抉择，归队时一次性结算并清空
+    active_expedition = Column(JSON, nullable=True)
     outcome = Column(JSON, nullable=True)  # 结局详情
     score = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, server_default=func.now())

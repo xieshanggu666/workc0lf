@@ -3,6 +3,7 @@
 
 项目没有引入 Alembic，这里用 ADD COLUMN 做前向兼容：
 - pending_crisis / last_resolution：旧档案没有待处理危机，补 NULL 即进入每日阶段
+- active_expedition：旧档案没有外出队伍，补 NULL 即仍按地堡日常循环运行
 - row_version：乐观锁版本号，旧行统一从 1 开始
 对已是最新结构的库为幂等无操作。
 """
@@ -26,6 +27,8 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN pending_crisis JSON"))
         if "last_resolution" not in columns:
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN last_resolution JSON"))
+        if "active_expedition" not in columns:
+            conn.execute(text("ALTER TABLE game_sessions ADD COLUMN active_expedition JSON"))
         if "row_version" not in columns:
             # NOT NULL + 常量默认值，存量行全部初始化为 1
             conn.execute(

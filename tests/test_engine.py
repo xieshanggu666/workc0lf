@@ -13,6 +13,7 @@ from app.services.engine import (
     BunkerEngine,
     BunkerEngineError,
     CRISIS_POOL,
+    EXPEDITION_POOL,
     FACILITY_ZH,
     FOOD,
     OXY,
@@ -67,6 +68,29 @@ class TriggerRand(FixedRand):
 
     def random(self):
         return 0.1
+
+
+class ExpeditionEventRand(FixedRand):
+    """外出遭遇固定为指定事件；random() 仍不触发险情/危机。"""
+
+    def __init__(self, event_key="ruins"):
+        self.event_key = event_key
+
+    def choice(self, seq):
+        if seq is EXPEDITION_POOL:
+            return next(e for e in seq if e["key"] == self.event_key)
+        return seq[0]
+
+
+class RiskRand(ExpeditionEventRand):
+    def random(self):
+        return 0.0
+
+
+def start_test_expedition(eng, resident_ids=None, provisions=None, token="exp-token"):
+    if resident_ids is None:
+        resident_ids = [eng.session.residents[0].id]
+    return eng.start_expedition(resident_ids, provisions or {}, token=token)
 
 
 def arm_crisis(eng, event_key, target=None):
@@ -626,6 +650,240 @@ def test_reaching_target_day_ends_without_pending_crisis(db):
     assert gs.status == "win"
     assert gs.pending_crisis is None
     assert eng.phase == "ended"
+
+
+# ---- 外出探索：离堡暂停生产、途中遭遇、归队统一结算 ----
+
+def test_start_expedition_deducts_carried_resources_and_suspends_member(db):
+    gs = make_session(db)
+    before = dict(gs.resources)
+    engineer = gs.residents[0]
+    engineer.job = "engineer"
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+
+    exp = start_test_expedition(eng, [engineer.id], {POWER: 5})
+    assert gs.active_expedition == exp
+    assert gs.resources[FOOD] == round(before[FOOD] - 2, 1)  # 每名队员最低携带 2 食物
+    assert gs.resources[WATER] == round(before[WATER] - 1, 1)
+    assert gs.resources[POWER] == round(before[POWER] - 5, 1)
+    assert exp["party"][0]["id"] == engineer.id
+    assert exp["pending_encounter"] is None  # 离堡当天尚未进入下一遭遇点
+
+
+def test_duplicate_start_expedition_same_token_replays_without_double_deduction(db):
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    rid = gs.residents[0].id
+    food_before = gs.resources[FOOD]
+    exp1 = start_test_expedition(eng, [rid], token="same-start")
+    exp2 = start_test_expedition(eng, [rid], token="same-start")
+    assert exp1["token"] == exp2["token"]
+    assert gs.resources[FOOD] == round(food_before - 2, 1)
+    assert len(gs.active_expedition["party"]) == 1
+
+
+def test_expedition_does_not_trigger_encounter_on_departure_day(db):
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand())
+    start_test_expedition(eng)
+    assert eng.phase == "daily"
+    assert gs.pending_crisis is None
+
+
+def test_advance_while_expedition_pending_encounter_blocked(db):
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand())
+    start_test_expedition(eng)
+    day = gs.day
+    eng.advance_day()
+    assert gs.active_expedition["pending_encounter"] is not None
+    assert eng.phase == "expedition"
+    with pytest.raises(BunkerEngineError):
+        eng.advance_day()
+    assert gs.day == day + 1
+
+
+def test_away_resident_pauses_bunker_consumption_and_job_bonus(db):
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand())
+    away = gs.residents[0]
+    away.job = "engineer"
+    start_test_expedition(eng, [away.id])
+
+    expected_power_before = gs.resources[POWER]
+    home = [r for r in gs.residents if r.id != away.id]
+    avg_morale = sum(r.morale for r in home) / len(home)
+    morale_factor = 0.6 + 0.4 * avg_morale / 100.0
+    # 堡内2人：发电基础8（无工程师加成）按士气产出 - 2*1 消耗
+    expected_power_after = round(expected_power_before + 8.0 * morale_factor - 2.0, 1)
+    eng.advance_day()
+    assert gs.resources[POWER] == expected_power_after
+
+
+def test_expedition_action_collects_loot_only_after_return(db):
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand("ruins"))
+    away = gs.residents[0]
+    start_test_expedition(eng, [away.id])
+    food_before = gs.resources[FOOD]
+    eng.advance_day()
+    encounter = gs.active_expedition["pending_encounter"]
+    _, detail, replayed = eng.resolve_expedition_encounter("careful_search", token=encounter["token"])
+    assert replayed is False
+    assert "食物" in detail
+    # 战利品仍在探索队身上，地堡库存未变
+    assert gs.resources[FOOD] == food_before
+    assert gs.active_expedition["loot"][FOOD] == 8
+
+    gs.active_expedition["returning"] = True
+    # 再推进一天：返程，归队统一入库
+    eng.advance_day()
+    assert gs.active_expedition is None
+    assert gs.resources[FOOD] == round(food_before + 8, 1)
+
+
+def test_duplicate_expedition_action_replays_without_double_loot(db):
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand("ruins"))
+    start_test_expedition(eng, [gs.residents[0].id])
+    eng.advance_day()
+    encounter = gs.active_expedition["pending_encounter"]
+    eng.resolve_expedition_encounter("careful_search", token=encounter["token"])
+    _, detail2, replayed = eng.resolve_expedition_encounter("careful_search", token=encounter["token"])
+    assert replayed is True
+    assert gs.active_expedition["loot"][FOOD] == 8
+    assert "获得食物 8" in detail2
+
+
+def test_expedition_casualties_settle_on_return(db):
+    gs = make_session(db)
+    away = gs.residents[0]
+    survivors_before = gs.survivors
+    eng = BunkerEngine(db, gs, rand=RiskRand("feral_dogs"))
+    start_test_expedition(eng, [away.id])
+    eng.advance_day()
+    encounter = gs.active_expedition["pending_encounter"]
+    eng.resolve_expedition_encounter("drive_off", token=encounter["token"])
+    assert gs.residents[0].alive == 1  # 途中只改快照，真实居民尚未死亡
+    gs.active_expedition["returning"] = True
+    eng.advance_day()
+    assert gs.residents[0].alive == 0
+    assert gs.survivors == survivors_before - 1
+    assert gs.active_expedition is None
+
+
+def test_turn_back_action_marks_returning_and_next_day_settles(db):
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand("ruins"))
+    start_test_expedition(eng, [gs.residents[0].id])
+    eng.advance_day()
+    encounter = gs.active_expedition["pending_encounter"]
+    _, _, replayed = eng.resolve_expedition_encounter("turn_back", token=encounter["token"])
+    assert replayed is False
+    assert gs.active_expedition["returning"] is True
+    assert gs.active_expedition["pending_encounter"] is None
+    eng.advance_day()
+    assert gs.active_expedition is None
+
+
+def test_max_depth_forces_return_after_third_encounter(db):
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand("ruins"))
+    start_test_expedition(eng, [gs.residents[0].id])
+    for depth in range(1, 4):
+        eng.advance_day()
+        encounter = gs.active_expedition["pending_encounter"]
+        assert encounter["depth"] == depth
+        eng.resolve_expedition_encounter("careful_search", token=encounter["token"])
+    assert gs.active_expedition["returning"] is True
+    eng.advance_day()
+    assert gs.active_expedition is None
+
+
+def test_rescue_adds_resident_on_return(db):
+    gs = make_session(db)
+    count_before = len(gs.residents)
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand("stranded_survivor"))
+    start_test_expedition(eng, [gs.residents[0].id])
+    eng.advance_day()
+    encounter = gs.active_expedition["pending_encounter"]
+    eng.resolve_expedition_encounter("rescue", token=encounter["token"])
+    assert len(gs.residents) == count_before  # 未归队前不入籍
+    gs.active_expedition["returning"] = True
+    eng.advance_day()
+    assert len(gs.residents) == count_before + 1
+    assert gs.survivors == 4
+    assert gs.residents[-1].name.startswith("流浪者")
+
+
+def test_away_resident_cannot_change_job(db):
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand())
+    rid = gs.residents[0].id
+    start_test_expedition(eng, [rid])
+    with pytest.raises(BunkerEngineError):
+        eng.set_job(rid, "farmer")
+
+
+def test_crisis_targets_only_home_residents_when_expedition_active(db):
+    gs = make_session(db)
+    away = gs.residents[0]
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand())
+    start_test_expedition(eng, [away.id])
+    event = next(e for e in CRISIS_POOL if e["key"] == "raid")
+    crisis = eng._build_crisis(event)
+    assert crisis["target_id"] != away.id
+    assert crisis["target_id"] in {r.id for r in gs.residents[1:]}
+
+
+def test_expedition_persists_and_recovers_after_reload(db):
+    from app.core.database import SessionLocal
+    from app.models import GameSession as GS
+
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=ExpeditionEventRand())
+    start_test_expedition(eng, [gs.residents[0].id])
+    db.commit()
+    sid = gs.id
+
+    db2 = SessionLocal()
+    try:
+        reloaded = db2.get(GS, sid)
+        assert reloaded.active_expedition is not None
+        assert reloaded.active_expedition["party"][0]["id"] == gs.residents[0].id
+    finally:
+        db2.close()
+
+
+def test_migration_backfills_active_expedition(db):
+    """旧结构表（无 active_expedition）经 ensure_schema 后补 NULL。"""
+    from sqlalchemy import text
+    from app.core.migration import ensure_schema as ensure_schema_migration
+    from app.core import database as db_module
+
+    gs = make_session(db)
+    db.commit()
+    db.expire_all()
+    db.execute(text("ALTER TABLE game_sessions RENAME TO game_sessions_old"))
+    db.execute(text(
+        "CREATE TABLE game_sessions ("
+        "id INTEGER PRIMARY KEY, name VARCHAR(64), day INTEGER, target_day INTEGER, "
+        "status VARCHAR(16), resources JSON, survivors INTEGER, pending_crisis JSON, "
+        "last_resolution JSON, outcome JSON, score INTEGER, row_version INTEGER, "
+        "created_at DATETIME, updated_at DATETIME)"
+    ))
+    db.execute(text(
+        "INSERT INTO game_sessions SELECT id,name,day,target_day,status,resources,survivors,"
+        "pending_crisis,last_resolution,outcome,score,row_version,created_at,updated_at "
+        "FROM game_sessions_old"
+    ))
+    db.execute(text("DROP TABLE game_sessions_old"))
+    db.commit()
+
+    ensure_schema_migration(db_module.engine)
+    db.expire_all()
+    gs = db.query(GameSession).first()
+    assert gs.active_expedition is None
 
 
 def test_old_archive_migration_backfills_columns(db):

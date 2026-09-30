@@ -22,6 +22,9 @@ from ..schemas import (
     SessionDetail,
     AdvanceResult,
     CrisisChoice,
+    ExpeditionStart,
+    ExpeditionAction,
+    ExpeditionResult,
     JobAssign,
     BuildRequest,
     BuildableInfo,
@@ -94,7 +97,8 @@ def get_session(sid: int, db: Session = Depends(get_db)):
     return get_session_detail(gs, db)
 
 
-def _serialize_resident(r):
+def _serialize_resident(r, away_ids=None):
+    away_ids = away_ids or set()
     return {
         "id": r.id,
         "name": r.name,
@@ -104,12 +108,16 @@ def _serialize_resident(r):
         "morale": r.morale,
         "alive": r.alive,
         "joined_day": r.joined_day,
+        "away": r.id in away_ids,
     }
 
 
 def get_session_detail(gs, db):
+    away_ids = set()
+    if gs.active_expedition:
+        away_ids = {p["id"] for p in gs.active_expedition.get("party", [])}
     residents = [
-        _serialize_resident(r)
+        _serialize_resident(r, away_ids)
         for r in gs.residents
     ]
     facilities = [
@@ -145,6 +153,7 @@ def get_session_detail(gs, db):
         score=gs.score,
         outcome=gs.outcome,
         pending_crisis=gs.pending_crisis,
+        active_expedition=gs.active_expedition,
         residents=residents,
         facilities=facilities,
         logs=logs,
@@ -198,6 +207,7 @@ def advance(sid: int, db: Session = Depends(get_db)):
     return AdvanceResult(session=get_session_detail(gs, db), crisis=crisis)
 
 
+
 @router.post("/sessions/{sid}/resolve", response_model=SessionDetail)
 def resolve_crisis(sid: int, body: CrisisChoice, db: Session = Depends(get_db)):
     gs = db.get(GameSession, sid)
@@ -229,6 +239,91 @@ def resolve_crisis(sid: int, body: CrisisChoice, db: Session = Depends(get_db)):
         except BunkerEngineConflict as e:
             raise HTTPException(409, str(e))
     return get_session_detail(gs, db)
+
+
+def _expedition_fingerprint(exp):
+    if not exp:
+        return None
+    return {
+        "token": exp.get("token"),
+        "party": [p.get("id") for p in exp.get("party", [])],
+        "provisions": exp.get("provisions", {}),
+    }
+
+
+@router.post("/sessions/{sid}/expeditions", response_model=ExpeditionResult, status_code=201)
+def start_expedition(sid: int, body: ExpeditionStart, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    eng = BunkerEngine(db, gs)
+    try:
+        expedition = eng.start_expedition(body.resident_ids, body.provisions, token=body.token)
+        db.commit()
+        db.refresh(gs)
+        expedition, replayed = gs.active_expedition, False
+    except BunkerEngineConflict as e:
+        db.rollback()
+        raise HTTPException(409, str(e))
+    except BunkerEngineError as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
+    except StaleDataError:
+        db.rollback()
+        db.refresh(gs)
+        expected_provisions = BunkerEngine(db, gs)._normalize_provisions(body.provisions)
+        fingerprint = _expedition_fingerprint(gs.active_expedition)
+        same = (
+            fingerprint
+            and body.token
+            and fingerprint["token"] == body.token
+            and fingerprint["party"] == body.resident_ids
+            and fingerprint["provisions"] == expected_provisions
+        )
+        if not same:
+            raise HTTPException(409, "档案已被其他请求更新，探索队没有重复派出")
+        expedition, replayed = gs.active_expedition, True
+    return ExpeditionResult(
+        session=get_session_detail(gs, db),
+        expedition=expedition,
+        detail="探索队已离堡",
+        replayed=replayed,
+    )
+
+
+@router.post("/sessions/{sid}/expeditions/encounter", response_model=ExpeditionResult)
+def resolve_expedition(sid: int, body: ExpeditionAction, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    eng = BunkerEngine(db, gs)
+    try:
+        expedition, detail, replayed = eng.resolve_expedition_encounter(
+            body.action_key, token=body.token
+        )
+        db.commit()
+        db.refresh(gs)
+        expedition = gs.active_expedition
+    except BunkerEngineConflict as e:
+        db.rollback()
+        raise HTTPException(409, str(e))
+    except BunkerEngineError as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
+    except StaleDataError:
+        db.rollback()
+        db.refresh(gs)
+        active = gs.active_expedition
+        last = active.get("last_action") if active else None
+        if not last or last.get("encounter_token") != body.token or last.get("action") != body.action_key:
+            raise HTTPException(409, "探索遭遇已被其他请求更新，请刷新后重试")
+        expedition, detail, replayed = active, last.get("detail", ""), True
+    return ExpeditionResult(
+        session=get_session_detail(gs, db),
+        expedition=expedition,
+        detail=detail,
+        replayed=replayed,
+    )
 
 
 @router.post("/sessions/{sid}/build", response_model=SessionDetail)

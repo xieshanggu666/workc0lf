@@ -29,6 +29,7 @@ class ResidentOut(BaseModel):
     morale: float
     alive: int
     joined_day: int
+    away: bool = False
 
     class Config:
         from_attributes = True
@@ -70,6 +71,7 @@ class SessionDetail(BaseModel):
     outcome: Optional[Dict[str, Any]] = None
     # 待处理危机快照：刷新/重进档案后前端据此恢复决策弹层
     pending_crisis: Optional[Dict[str, Any]] = None
+    active_expedition: Optional[Dict[str, Any]] = None
     residents: List[ResidentOut] = []
     facilities: List[FacilityOut] = []
     logs: List[LogOut] = []
@@ -86,6 +88,25 @@ class CrisisChoice(BaseModel):
     target_id: Optional[int] = None
     # 待处理危机的一次性凭据，用于识别过期/并发的旧请求；旧客户端可省略
     token: Optional[str] = None
+
+
+class ExpeditionStart(BaseModel):
+    resident_ids: List[int]
+    provisions: Dict[str, float] = {}
+    # 出发动作的一次性凭据；重复点击/并发请求据此回放同一个离堡结果
+    token: Optional[str] = None
+
+
+class ExpeditionAction(BaseModel):
+    action_key: str
+    token: Optional[str] = None
+
+
+class ExpeditionResult(BaseModel):
+    session: SessionDetail
+    expedition: Optional[Dict[str, Any]] = None
+    detail: str = ""
+    replayed: bool = False
 
 
 class JobAssign(BaseModel):
