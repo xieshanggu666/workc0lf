@@ -26,6 +26,8 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN pending_crisis JSON"))
         if "last_resolution" not in columns:
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN last_resolution JSON"))
+        if "expedition" not in columns:
+            conn.execute(text("ALTER TABLE game_sessions ADD COLUMN expedition JSON"))
         if "row_version" not in columns:
             # NOT NULL + 常量默认值，存量行全部初始化为 1
             conn.execute(

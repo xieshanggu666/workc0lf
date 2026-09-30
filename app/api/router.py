@@ -22,6 +22,9 @@ from ..schemas import (
     SessionDetail,
     AdvanceResult,
     CrisisChoice,
+    ExpeditionSend,
+    ExpeditionEncounterChoice,
+    ExpeditionReturn,
     JobAssign,
     BuildRequest,
     BuildableInfo,
@@ -94,7 +97,7 @@ def get_session(sid: int, db: Session = Depends(get_db)):
     return get_session_detail(gs, db)
 
 
-def _serialize_resident(r):
+def _serialize_resident(r, away_ids=None):
     return {
         "id": r.id,
         "name": r.name,
@@ -103,13 +106,18 @@ def _serialize_resident(r):
         "health": r.health,
         "morale": r.morale,
         "alive": r.alive,
+        "away": 1 if (away_ids and r.id in away_ids) else 0,
         "joined_day": r.joined_day,
     }
 
 
 def get_session_detail(gs, db):
+    # 探索队成员编号：用于标注居民"探索中"状态
+    away_ids = set()
+    if gs.expedition and gs.expedition.get("status") == "away":
+        away_ids = set(gs.expedition.get("members", []))
     residents = [
-        _serialize_resident(r)
+        _serialize_resident(r, away_ids)
         for r in gs.residents
     ]
     facilities = [
@@ -145,6 +153,7 @@ def get_session_detail(gs, db):
         score=gs.score,
         outcome=gs.outcome,
         pending_crisis=gs.pending_crisis,
+        expedition=gs.expedition,
         residents=residents,
         facilities=facilities,
         logs=logs,
@@ -228,6 +237,62 @@ def resolve_crisis(sid: int, body: CrisisChoice, db: Session = Depends(get_db)):
             )
         except BunkerEngineConflict as e:
             raise HTTPException(409, str(e))
+    return get_session_detail(gs, db)
+
+
+# ---- 探索队 ----
+@router.post("/sessions/{sid}/expedition/send", response_model=SessionDetail)
+def send_expedition(sid: int, body: ExpeditionSend, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    _run_mutation(db, gs, lambda eng: eng.send_expedition(body.member_ids, body.supplies))
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/expedition/resolve", response_model=SessionDetail)
+def resolve_expedition(sid: int, body: ExpeditionEncounterChoice, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    eng = BunkerEngine(db, gs)
+    try:
+        eng.resolve_expedition_encounter(body.choice_key, token=body.token)
+        db.commit()
+        db.refresh(gs)
+    except BunkerEngineConflict as e:
+        db.rollback()
+        raise HTTPException(409, str(e))
+    except BunkerEngineError as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
+    except StaleDataError:
+        # 并发的重复结算：版本不匹配说明对方已先落库，幂等回放当前状态
+        db.rollback()
+        db.refresh(gs)
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/expedition/return", response_model=SessionDetail)
+def return_expedition(sid: int, body: ExpeditionReturn, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    eng = BunkerEngine(db, gs)
+    try:
+        eng.return_expedition(token=body.token)
+        db.commit()
+        db.refresh(gs)
+    except BunkerEngineConflict as e:
+        db.rollback()
+        raise HTTPException(409, str(e))
+    except BunkerEngineError as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
+    except StaleDataError:
+        # 并发的重复返程：幂等回放，战利品只结算一次
+        db.rollback()
+        db.refresh(gs)
     return get_session_detail(gs, db)
 
 

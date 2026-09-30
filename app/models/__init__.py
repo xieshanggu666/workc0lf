@@ -11,6 +11,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from sqlalchemy.ext.mutable import MutableDict
 
 from ..core.database import Base
 
@@ -35,6 +36,10 @@ class GameSession(Base):
     pending_crisis = Column(JSON, nullable=True)
     # 最近一次危机结算的幂等凭据，重复/并发落败请求据此安全回放，不再二次结算
     last_resolution = Column(JSON, nullable=True)
+    # 探索队状态快照（含一次性 token、队员、携带物资、行军天数、遭遇与战利品），
+    # 落库后刷新可恢复同一支队伍；为 None 表示当前没有在外的探索队。
+    # MutableDict.as_mutable：原地修改 JSON 字段（如 exp["travel_days"]=1）也会被追踪落库
+    expedition = Column(MutableDict.as_mutable(JSON), nullable=True)
     outcome = Column(JSON, nullable=True)  # 结局详情
     score = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, server_default=func.now())

@@ -42,6 +42,12 @@ JOB_EFFICIENCY = {"engineer": 1.25, "farmer": 1.3, "general": 1.0}
 # 危机事件概率
 CRISIS_DAY_CHANCE = 0.45
 
+# 探索队系统
+EXPEDITION_SUPPLY_PER_DAY = {FOOD: 1.0, WATER: 1.0}  # 每人每日消耗自带物资
+EXPEDITION_MAX_DAYS = 7       # 最长探索天数，期满强制返程
+EXPEDITION_ENCOUNTER_CHANCE = 0.85  # 每日行军遭遇概率
+EXPEDITION_MAX_MEMBERS = 4    # 每支探索队上限
+
 
 def _clamp(v, lo=0.0, hi=100.0):
     return max(lo, min(hi, v))
@@ -66,6 +72,8 @@ class BunkerEngineConflict(BunkerEngineError):
 #   crisis —— 危机阶段，存在待处理危机，除结算危机外拒绝一切推进与经营动作
 #   ended  —— 终局（win/over），拒绝任何状态变更
 PHASE_DAILY, PHASE_CRISIS, PHASE_ENDED = "daily", "crisis", "ended"
+# 探索阶段：探索队在外且存在待处理遭遇，状态机拒绝一切经营/推进动作
+PHASE_EXPEDITION = "expedition"
 
 
 class BunkerEngine:
@@ -79,7 +87,12 @@ class BunkerEngine:
     def phase(self):
         if self.session.status != "running":
             return PHASE_ENDED
-        return PHASE_CRISIS if self.session.pending_crisis else PHASE_DAILY
+        if self.session.pending_crisis:
+            return PHASE_CRISIS
+        exp = self.session.expedition
+        if exp and exp.get("status") == "away" and exp.get("pending_encounter"):
+            return PHASE_EXPEDITION
+        return PHASE_DAILY
 
     def _require_phase(self, phase, message):
         if self.phase != phase:
@@ -121,18 +134,54 @@ class BunkerEngine:
         return out
 
     def job_count(self, job):
-        return sum(1 for r in self.session.residents if r.alive and r.job == job)
+        away = self._away_resident_ids()
+        return sum(1 for r in self.session.residents if r.alive and r.job == job and r.id not in away)
 
     def active_facilities(self):
         return [f for f in self.session.facilities if f.status == "active"]
 
+    # ---- 探索队成员追踪 ----
+    def _away_resident_ids(self):
+        """当前探索队编制内的居民编号（无论生死）；无在外队伍时为空集。"""
+        exp = self.session.expedition
+        if not exp or exp.get("status") != "away":
+            return set()
+        return set(exp.get("members", []))
+
+    def _away_residents(self):
+        """探索队编制内的全部居民（含已阵亡，用于返程结算）。"""
+        ids = self._away_resident_ids()
+        return [r for r in self.session.residents if r.id in ids]
+
+    def _in_bunker_residents(self):
+        """地堡内存活居民（排除探索队成员）。"""
+        away = self._away_resident_ids()
+        return [r for r in self.session.residents if r.alive and r.id not in away]
+
+    def _in_bunker_count(self):
+        return len(self._in_bunker_residents())
+
     # ---- 每日推进 ----
     def advance_day(self):
-        # 终局或存在待处理危机时都不能推进：危机不可被“再点一天”跳过
-        self._require_phase(PHASE_DAILY, "存在待处理危机，必须先做出抉择才能推进")
+        # 终局或存在待处理抉择（危机/探索遭遇）时都不能推进：抉择不可被"再点一天"跳过
+        self._require_phase(PHASE_DAILY, "存在待处理抉择，必须先完成才能推进")
         self.session.day += 1
         self._apply_production_and_consumption()
         self._apply_health_morale()
+        exp = self.session.expedition
+        if exp and exp.get("status") == "away":
+            # 探索队在外出差：地堡按在堡人口结算，探索队消耗自带物资、行军并触发遭遇
+            self._apply_expedition_travel(exp)
+            # 强制返程（补给耗尽/期满/全员失联）会清除探索队状态：
+            # 此时不得再用旧 exp 触发遭遇，否则会把已结算的队伍恢复成"在外"
+            if self.session.expedition is None:
+                if self._check_end():
+                    return None
+                return None
+            if self._check_end():
+                return None
+            # 探索队行军中：触发遭遇（替代地堡危机），遭遇挂起后进入 expedition 阶段
+            return self._maybe_trigger_expedition_encounter(exp)
         # 终局优先：抵达目标日或全面崩溃直接结算结局，不再凭空挂起一个
         # 永远无法处理的危机（统一每日推进 → 危机处理 → 终局的流转）
         if self._check_end():
@@ -140,7 +189,8 @@ class BunkerEngine:
         return self._maybe_trigger_crisis()
 
     def _apply_production_and_consumption(self):
-        pop = self.session.survivors
+        # 离堡人员不消耗地堡物资（吃自带口粮），地堡消耗只计在堡人口
+        pop = self._in_bunker_count()
         # 士气系数(平均士气)：低士气降低产出
         avg_morale = self.avg_morale()
         morale_factor = 0.6 + 0.4 * (avg_morale / 100.0)
@@ -171,9 +221,12 @@ class BunkerEngine:
 
     def _apply_health_morale(self):
         res = self.get_resources()
-        # 资源见底，健康/士气下降
+        away = self._away_resident_ids()
+        # 资源不足影响（仅作用于在堡居民；探索队吃自带物资，不受地堡短缺波及）
         for r in self.session.residents:
             if not r.alive:
+                continue
+            if r.id in away:
                 continue
             morale = r.morale
             # 资源不足影响
@@ -204,8 +257,8 @@ class BunkerEngine:
         critical = [k for k in RESOURCE_KEYS if res.get(k, 0) <= 0]
         if not critical:
             return
-        # 每日最多因匮乏死 1 人，依次从最弱居民开始
-        alive = [r for r in self.session.residents if r.alive]
+        # 每日最多因匮乏死 1 人，依次从在堡最弱居民开始（探索队不在堡内，不参与地堡匮乏判定）
+        alive = self._in_bunker_residents()
         if not alive:
             return
         weakest = min(alive, key=lambda r: r.health)
@@ -478,6 +531,285 @@ class BunkerEngine:
         self.db.add(r)
         self.session.survivors += 1
 
+    # ---- 探索队 ----
+    def _random_survivor_name(self):
+        import random
+        surnames = list("赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许")
+        givens = list("伟芳娜敏静丽强磊军洋勇艳杰娟涛明超秀兰霞平刚桂英华玉萍红斌")
+        return random.choice(surnames) + random.choice(givens)
+
+    def send_expedition(self, member_ids, supplies):
+        """派遣探索队：选择在堡居民并分配自带物资，队伍出发后暂停地堡生产。
+
+        离堡人员不参与设施产出、不消耗地堡口粮；行军消耗自带物资，
+        途中遭遇由玩家抉择，返程时统一结算战利品与伤亡。
+        """
+        self._ensure_running()
+        if self.phase != PHASE_DAILY:
+            raise BunkerEngineError("当前状态无法派遣探索队")
+        if self.session.expedition:
+            raise BunkerEngineError("已有探索队在外，无法同时派遣第二支队伍")
+        if not member_ids:
+            raise BunkerEngineError("必须选择至少一名居民参加探索队")
+        if len(member_ids) > EXPEDITION_MAX_MEMBERS:
+            raise BunkerEngineError(f"探索队最多 {EXPEDITION_MAX_MEMBERS} 人")
+        # 校验队员：必须是在堡存活居民
+        members = []
+        for mid in member_ids:
+            r = next((x for x in self.session.residents if x.id == mid), None)
+            if not r or not r.alive:
+                raise BunkerEngineError("队员不存在或已故，无法参加探索队")
+            if r.id in self._away_resident_ids():
+                raise BunkerEngineError(f"{r.name} 已在探索队中")
+            members.append(r)
+        # 校验并扣除自带物资
+        supply_cost = {}
+        for k, v in (supplies or {}).items():
+            if k not in RESOURCE_KEYS:
+                raise BunkerEngineError(f"未知物资 {k}")
+            if v < 0:
+                raise BunkerEngineError("物资数量不能为负")
+            supply_cost[k] = float(v)
+        if not self._can_afford(supply_cost):
+            raise BunkerEngineError("物资不足，无法派遣")
+        for k, v in supply_cost.items():
+            self._add_resource(k, -v)
+        # 写入探索队快照（含一次性 token，刷新后恢复同一支队伍）
+        exp = {
+            "token": uuid.uuid4().hex,
+            "status": "away",
+            "started_day": self.session.day,
+            "members": [r.id for r in members],
+            "supplies": dict(supply_cost),
+            "travel_days": 0,
+            "encounters_resolved": 0,
+            "pending_encounter": None,
+            "loot": {},
+            "casualties": [],
+            "last_return": None,
+        }
+        self.session.expedition = dict(exp)
+        names = "、".join(r.name for r in members)
+        self._log("system", "探索队出发", f"{names} 携带物资外出探索。", decision="派遣探索队")
+        return exp
+
+    def _apply_expedition_travel(self, exp):
+        """探索队每日行军：消耗自带物资、累计天数，触发强制返程判定。"""
+        alive_members = [r for r in self._away_residents() if r.alive]
+        if not alive_members:
+            # 全员失联：强制返程（无人生还）
+            self._settle_expedition(exp, reason="探索队全员失联")
+            return
+        exp["travel_days"] = exp.get("travel_days", 0) + 1
+        # 消耗自带口粮
+        n = len(alive_members)
+        supplies = exp.get("supplies", {})
+        for k in (FOOD, WATER):
+            cost = EXPEDITION_SUPPLY_PER_DAY[k] * n
+            supplies[k] = round(supplies.get(k, 0.0) - cost, 1)
+        exp["supplies"] = supplies
+        # 物资耗尽或达到最长探索天数：强制返程
+        if supplies.get(FOOD, 0) <= 0 or supplies.get(WATER, 0) <= 0:
+            self._settle_expedition(exp, reason="补给耗尽，探索队被迫返程")
+            return
+        if exp["travel_days"] >= EXPEDITION_MAX_DAYS:
+            self._settle_expedition(exp, reason="探索期满，探索队返程")
+            return
+        # 整体回写，确保 JSON 列变更被追踪并落库
+        self.session.expedition = dict(exp)
+
+    def _maybe_trigger_expedition_encounter(self, exp):
+        """每日行军后概率触发遭遇；已有待处理遭遇时不重复触发。"""
+        if exp.get("pending_encounter"):
+            return exp["pending_encounter"]
+        if self.rand.random() > EXPEDITION_ENCOUNTER_CHANCE:
+            return None
+        event = self.rand.choice(EXPEDITION_ENCOUNTERS)
+        encounter = self._build_expedition_encounter(event, exp)
+        exp["pending_encounter"] = encounter
+        # 整体回写，确保 JSON 列变更被追踪并落库
+        self.session.expedition = dict(exp)
+        return encounter
+
+    def _build_expedition_encounter(self, event, exp):
+        alive_members = [r for r in self._away_residents() if r.alive]
+        # 仅当存在单体健康效果的决策时才随机目标队员
+        needs_target = any(
+            self._choice_targeted(c) for c in event["choices"]
+        )
+        target = self.rand.choice(alive_members) if needs_target and alive_members else None
+        return {
+            "token": uuid.uuid4().hex,
+            "event": event["key"],
+            "day": self.session.day,
+            "title": event["title"],
+            "desc": event["desc"],
+            "needs_target": needs_target,
+            "target_id": target.id if target else None,
+            "target_name": target.name if target else None,
+            "choices": [
+                {
+                    "key": c["key"],
+                    "label": c["label"],
+                    "hint": c.get("hint", ""),
+                    "targeted": self._choice_targeted(c),
+                }
+                for c in event["choices"]
+            ],
+        }
+
+    def resolve_expedition_encounter(self, choice_key, token=None):
+        """处理探索队途中遭遇：抉择影响队员健康/士气、物资与战利品。
+
+        结算必须命中央档案里唯一的待处理遭遇：事件、选项、单体目标都与存档绑定，
+        token 用于识别过期/重复请求；结算后待处理遭遇被清除，重复提交只回放。
+        """
+        self._ensure_running()
+        exp = self.session.expedition
+        if not exp or exp.get("status") != "away":
+            raise BunkerEngineError("当前没有在外的探索队")
+        pending = exp.get("pending_encounter")
+        if not pending:
+            raise BunkerEngineError("当前没有待处理的探索遭遇")
+        if token is not None and pending.get("token") and token != pending["token"]:
+            raise BunkerEngineConflict("该遭遇决策已过期，请刷新后重试")
+        event_key = pending.get("event")
+        event = next((e for e in EXPEDITION_ENCOUNTERS if e["key"] == event_key), None)
+        if not event:
+            raise BunkerEngineError("探索遭遇已失效，请刷新档案后重试")
+        choice = next((c for c in event["choices"] if c["key"] == choice_key), None)
+        if not choice:
+            raise BunkerEngineError("未知决策选项")
+        effects = choice.get("effects", {})
+        # 单体目标校验：必须是队内存活队员，且与待处理遭遇绑定
+        targeted = self._choice_targeted(choice)
+        target = None
+        if targeted:
+            bound_id = pending.get("target_id")
+            if bound_id is None:
+                raise BunkerEngineError("该决策需要指定一名队员作为目标")
+            target = next((r for r in self._away_residents() if r.id == bound_id), None)
+            if not target or not target.alive:
+                raise BunkerEngineError("目标队员不在队中或已故，无法作为效果目标")
+        # 在应用任何效果前完成校验，保证失败时档案状态不发生部分变更
+        detail_parts = []
+        alive_members = [r for r in self._away_residents() if r.alive]
+        # 战利品（单独累计，返程时统一入库）
+        loot = exp.get("loot", {})
+        for k, v in effects.get("loot", {}).items():
+            loot[k] = round(loot.get(k, 0.0) + v, 1)
+            detail_parts.append(f"战利品 {RESOURCE_ZH.get(k, k)} +{v:g}")
+        exp["loot"] = loot
+        # 物资损失（从探索队自带物资中扣除）
+        supplies = exp.get("supplies", {})
+        for k, v in effects.get("supply_loss", {}).items():
+            supplies[k] = round(supplies.get(k, 0.0) - v, 1)
+            detail_parts.append(f"物资损失 {RESOURCE_ZH.get(k, k)} -{v:g}")
+        exp["supplies"] = supplies
+        # 健康/士气：单体作用于目标队员，全体作用于队内存活者
+        for stat, zh in (("health", "健康"), ("morale", "士气")):
+            if stat not in effects:
+                continue
+            spec = effects[stat]
+            val = self._effect_value(spec)
+            if self._effect_scope(spec) == "single":
+                pool = [target]
+                scope = f"仅{target.name}"
+            else:
+                pool = alive_members
+                scope = "全体队员"
+            for r in pool:
+                setattr(r, stat, _clamp(getattr(r, stat) + val))
+                if r.health <= 0 and r.alive:
+                    r.alive = 0
+                    r.health = 0
+                    if r.id not in exp.get("casualties", []):
+                        exp["casualties"].append(r.id)
+                        self.session.survivors = max(0, self.session.survivors - 1)
+            detail_parts.append(f"{zh} {val:+.0f}（{scope}）")
+        # 偶遇幸存者加入队伍
+        if effects.get("add_resident"):
+            name = self._random_survivor_name()
+            self.db.flush()
+            r = Resident(
+                session_id=self.session.id, name=name, job="general",
+                health=60.0, morale=50.0, alive=1, joined_day=self.session.day,
+            )
+            self.db.add(r)
+            self.db.flush()  # 取得新居民 id
+            exp["members"].append(r.id)
+            self.session.survivors += 1
+            detail_parts.append(f"新幸存者 {name} 加入队伍")
+        # 日志与实际结算同一作用域
+        scope_zh = f"（目标：{target.name}）" if targeted else ""
+        detail = "，".join(detail_parts) if detail_parts else "无显著变化"
+        self._log("crisis", f"探索遭遇·{event['title']}", f"选择「{choice['label']}」{scope_zh}：{detail}", decision=choice["label"])
+        # 清除待处理遭遇，队伍继续在外行军
+        exp["pending_encounter"] = None
+        exp["encounters_resolved"] = exp.get("encounters_resolved", 0) + 1
+        self.session.expedition = dict(exp)
+        return detail, False
+
+    def return_expedition(self, token=None):
+        """玩家主动召回探索队：结算战利品入库、伤亡扣减、剩余物资归还。
+
+        返程必须命中央档案里唯一的在外探索队；token 用于识别过期/重复请求。
+        结算后探索队状态被清除并留下幂等凭据，重复提交只回放上次结果。
+        """
+        self._ensure_running()
+        exp = self.session.expedition
+        if not exp or exp.get("status") != "away":
+            raise BunkerEngineError("当前没有在外的探索队")
+        if exp.get("pending_encounter"):
+            raise BunkerEngineError("探索队还有未处理的遭遇，无法返程")
+        if token is not None and exp.get("token") and token != exp["token"]:
+            raise BunkerEngineConflict("探索队状态已过期，请刷新后重试")
+        return self._settle_expedition(exp, reason="探索队安全返程")
+
+    def _settle_expedition(self, exp, reason):
+        """结算探索队返程：战利品入库、剩余自带物资归还、伤亡扣减。
+
+        幂等：以 token + 出发日为凭据，重复调用只回放，不二次发放战利品。
+        返回 (detail, replayed)。
+        """
+        # 幂等回放：已有同一支队伍的返程结算记录
+        last = exp.get("last_return")
+        if last and last.get("token") == exp.get("token"):
+            return last.get("detail", ""), True
+        members = self._away_residents()
+        dead_members = [r for r in members if not r.alive]
+        # 战利品入库
+        loot = exp.get("loot", {})
+        loot_parts = [f"{RESOURCE_ZH.get(k, k)} +{v:g}" for k, v in loot.items() if v > 0]
+        for k, v in loot.items():
+            if v > 0:
+                self._add_resource(k, v)
+        # 剩余自带物资归还地堡
+        supplies = exp.get("supplies", {})
+        supply_parts = [f"剩余{RESOURCE_ZH.get(k, k)} +{round(v, 1):g}" for k, v in supplies.items() if v > 0]
+        for k, v in supplies.items():
+            if v > 0:
+                self._add_resource(k, v)
+        # 伤亡（阵亡队员已在遭遇结算时扣减过 survivors，此处不再重复扣减）
+        casualty_names = [r.name for r in dead_members]
+        # 组装日志
+        detail_parts = []
+        if loot_parts:
+            detail_parts.append("战利品：" + "、".join(loot_parts))
+        if supply_parts:
+            detail_parts.append("归还物资：" + "、".join(supply_parts))
+        if casualty_names:
+            detail_parts.append(f"殉职：{'、'.join(casualty_names)}")
+        else:
+            detail_parts.append("全员平安归来")
+        detail = "；".join(detail_parts)
+        self._log("system", f"探索队返程（{reason}）", detail, decision="返程结算")
+        # 记录幂等凭据并清除探索队状态
+        exp["last_return"] = {"token": exp.get("token"), "day": self.session.day, "detail": detail}
+        self.session.expedition = None
+        self._check_end()
+        return detail, False
+
     # ---- 扩建 ----
     def build_facility(self, category):
         self._require_daily_phase("建造设施")
@@ -527,6 +859,8 @@ class BunkerEngine:
         r = next((x for x in self.session.residents if x.id == resident_id), None)
         if not r or not r.alive:
             raise BunkerEngineError("居民不存在或已故")
+        if r.id in self._away_resident_ids():
+            raise BunkerEngineError("探索队中的居民无法调整岗位")
         r.job = job
 
     # ---- 结局判定 ----
@@ -697,6 +1031,175 @@ CRISIS_POOL = [
                 "label": "集中避寒",
                 "hint": "士气下降，但省下燃料",
                 "effects": {"morale": -10},
+            },
+        ],
+    },
+]
+
+
+# ============ 探索队遭遇池（外出探索途中的遭遇决策树） ============
+# 与地堡危机相互独立：探索队在外时，每日行军触发的是探索遭遇而非地堡危机。
+# 效果键：
+#   loot       —— 战利品，单独累计，返程时统一入库
+#   supply_loss —— 从探索队自带物资中扣除
+#   health/morale —— 队员健康/士气（single 仅作用于目标队员，all 作用于全体队员）
+#   add_resident —— 有幸存者加入队伍
+EXPEDITION_ENCOUNTERS = [
+    {
+        "key": "cache",
+        "title": "废弃补给点",
+        "desc": "探索队在一处废墟中发现半埋的废弃补给箱，外观尚可辨认。",
+        "choices": [
+            {
+                "key": "search_carefully",
+                "label": "仔细搜索",
+                "hint": "耗时但可能获得更多物资",
+                "effects": {"loot": {FOOD: 8, WATER: 6}},
+            },
+            {
+                "key": "grab_quickly",
+                "label": "快速搜刮",
+                "hint": "安全但收获有限",
+                "effects": {"loot": {FOOD: 4, WATER: 3}},
+            },
+        ],
+    },
+    {
+        "key": "beast",
+        "title": "异兽袭击",
+        "desc": "一头变异巨兽从废墟中窜出，挡住了去路。",
+        "choices": [
+            {
+                "key": "fight",
+                "label": "武装驱赶",
+                "hint": "可能有人受伤，但能保住物资并缴获战利品",
+                "effects": {"health": {"value": -12, "target": "single"}, "loot": {FOOD: 5}},
+            },
+            {
+                "key": "flee",
+                "label": "绕道撤退",
+                "hint": "损失部分物资，但无人受伤",
+                "effects": {"supply_loss": {FOOD: 6, WATER: 4}, "morale": -5},
+            },
+        ],
+    },
+    {
+        "key": "weather",
+        "title": "恶劣天气",
+        "desc": "辐射尘暴骤起，能见度极低，探索队被迫寻找掩体。",
+        "choices": [
+            {
+                "key": "take_shelter",
+                "label": "就地躲避",
+                "hint": "消耗一日物资，士气下降",
+                "effects": {"supply_loss": {FOOD: 3, WATER: 3}, "morale": -8},
+            },
+            {
+                "key": "push_through",
+                "label": "冒雨前进",
+                "hint": "可能生病，但不耽误行程",
+                "effects": {"health": -6, "morale": -3},
+            },
+        ],
+    },
+    {
+        "key": "survivors",
+        "title": "偶遇幸存者",
+        "desc": "探索队遇到一群流离失所的幸存者，他们请求加入地堡。",
+        "choices": [
+            {
+                "key": "accept",
+                "label": "接纳加入",
+                "hint": "新增一名幸存者，但消耗更多补给",
+                "effects": {"add_resident": True, "supply_loss": {FOOD: 4, WATER: 3}},
+            },
+            {
+                "key": "trade",
+                "label": "交换物资",
+                "hint": "用自带物资换取情报与小份补给",
+                "effects": {"supply_loss": {FOOD: 3}, "loot": {POWER: 5}, "morale": 3},
+            },
+            {
+                "key": "refuse",
+                "label": "拒绝并离开",
+                "hint": "保持警惕，安然离开",
+                "effects": {"morale": -2},
+            },
+        ],
+    },
+    {
+        "key": "ruins",
+        "title": "废墟探索",
+        "desc": "一座保存较完整的废弃建筑矗立在眼前，隐约有物资的气息。",
+        "choices": [
+            {
+                "key": "deep_explore",
+                "label": "深入探索",
+                "hint": "高风险高回报，可能有重大伤亡",
+                "effects": {"loot": {FOOD: 12, WATER: 8, POWER: 6}, "health": {"value": -15, "target": "single"}},
+            },
+            {
+                "key": "outer_search",
+                "label": "外围搜索",
+                "hint": "安全获得少量物资",
+                "effects": {"loot": {FOOD: 5, WATER: 4}},
+            },
+        ],
+    },
+    {
+        "key": "lost",
+        "title": "迷路",
+        "desc": "复杂的废墟巷道让探索队迷失了方向，补给在不知不觉中消耗。",
+        "choices": [
+            {
+                "key": "retrace",
+                "label": "凭记忆折返",
+                "hint": "消耗额外物资寻找归路",
+                "effects": {"supply_loss": {FOOD: 5, WATER: 4}, "morale": -5},
+            },
+            {
+                "key": "climb_high",
+                "label": "登高辨认",
+                "hint": "冒险登高，可能有意外收获",
+                "effects": {"loot": {FOOD: 3}, "health": -4, "morale": 2},
+            },
+        ],
+    },
+    {
+        "key": "airdrop",
+        "title": "空投补给",
+        "desc": "一架老旧的运输机残骸旁，探索队发现了未被开启的空投舱。",
+        "choices": [
+            {
+                "key": "open_carefully",
+                "label": "小心开启",
+                "hint": "稳定获得补给",
+                "effects": {"loot": {FOOD: 6, WATER: 6, POWER: 4, OXY: 4}},
+            },
+            {
+                "key": "force_open",
+                "label": "强行破开",
+                "hint": "可能获得更多，也可能损坏物资",
+                "effects": {"loot": {FOOD: 10, WATER: 8, POWER: 6}, "supply_loss": {OXY: 3}},
+            },
+        ],
+    },
+    {
+        "key": "trap",
+        "title": "陷阱",
+        "desc": "探索队触发了一处老旧的捕兽夹，一名队员被夹住。",
+        "choices": [
+            {
+                "key": "free_carefully",
+                "label": "小心解救",
+                "hint": "可能加重伤势，但能保全物资",
+                "effects": {"health": {"value": -10, "target": "single"}},
+            },
+            {
+                "key": "force_free",
+                "label": "强行挣脱",
+                "hint": "伤势更重，但不耽误行程",
+                "effects": {"health": {"value": -18, "target": "single"}, "supply_loss": {FOOD: 2}},
             },
         ],
     },

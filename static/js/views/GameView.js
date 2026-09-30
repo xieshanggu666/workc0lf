@@ -11,6 +11,9 @@ window.GameView = {
       config: null,
       buildings: [],
       selectedJob: {},
+      showExpeditionDialog: false,
+      expMembers: [],
+      expSupplies: { food: 0, water: 0 },
     };
   },
   created() { this.init(); },
@@ -93,6 +96,75 @@ window.GameView = {
       } catch (e) { this.error = e.message; }
     },
     setJobSel(rid, job) { this.selectedJob[rid] = job; },
+    // ---- 探索队 ----
+    openExpeditionDialog() {
+      this.error = "";
+      this.expMembers = [];
+      this.expSupplies = { food: 0, water: 0 };
+      this.showExpeditionDialog = true;
+    },
+    toggleMember(id) {
+      const i = this.expMembers.indexOf(id);
+      if (i >= 0) this.expMembers.splice(i, 1);
+      else {
+        if (this.expMembers.length >= 4) { this.error = "探索队最多 4 人"; return; }
+        this.expMembers.push(id);
+      }
+    },
+    async sendExpedition() {
+      this.error = "";
+      if (!this.expMembers.length) { this.error = "必须选择至少一名居民"; return; }
+      if (this.crisis) return;
+      this.loading = true;
+      try {
+        const supplies = {};
+        for (const k of ["food", "water"]) {
+          const v = Number(this.expSupplies[k]) || 0;
+          if (v > 0) supplies[k] = v;
+        }
+        this.s = await Api.post(`/api/sessions/${this.sid}/expedition/send`, {
+          member_ids: this.expMembers,
+          supplies,
+        });
+        this.showExpeditionDialog = false;
+      } catch (e) { this.error = e.message; }
+      finally { this.loading = false; }
+    },
+    async resolveExpeditionEncounter(c) {
+      this.error = "";
+      this.loading = true;
+      try {
+        const body = { choice_key: c.key, token: this.s.expedition.pending_encounter.token };
+        this.s = await Api.post(`/api/sessions/${this.sid}/expedition/resolve`, body);
+      } catch (e) { this.error = e.message; await this.loadSession(); }
+      finally { this.loading = false; }
+    },
+    async returnExpedition() {
+      this.error = "";
+      this.loading = true;
+      try {
+        const body = { token: this.s.expedition.token };
+        this.s = await Api.post(`/api/sessions/${this.sid}/expedition/return`, body);
+      } catch (e) { this.error = e.message; await this.loadSession(); }
+      finally { this.loading = false; }
+    },
+    expMemberNames() {
+      if (!this.s || !this.s.expedition) return "";
+      const ids = this.s.expedition.members || [];
+      return ids.map(id => {
+        const r = this.s.residents.find(x => x.id === id);
+        return r ? r.name : "?";
+      }).join("、");
+    },
+    expLootText() {
+      if (!this.s || !this.s.expedition) return "";
+      const loot = this.s.expedition.loot || {};
+      const parts = [];
+      for (const k of ["food", "water", "power", "oxygen"]) {
+        if (loot[k] > 0) parts.push(`${{food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k]}+${Math.round(loot[k])}`);
+      }
+      return parts.join("、") || "暂无";
+    },
     resPct(k) {
       const cap = { food: 300, water: 300, power: 200, oxygen: 200 };
       const c = cap[k] || 100;
@@ -105,6 +177,17 @@ window.GameView = {
   },
   computed: {
     alive() { return this.s ? this.s.residents.filter(r => r.alive) : []; },
+    expPending() {
+      return !!(this.s && this.s.expedition && this.s.expedition.pending_encounter);
+    },
+    pendingTitle() {
+      if (this.crisis) return "请先处理当前危机";
+      if (this.expPending) return "请先处理探索遭遇";
+      return "";
+    },
+    inBunkerAlive() {
+      return this.s ? this.s.residents.filter(r => r.alive && !r.away) : [];
+    },
   },
   template: `
   <div v-if="s" class="game" :class="clazz(s.status)">
@@ -125,8 +208,8 @@ window.GameView = {
         <div class="res-val">{{ fmt(s.resources[k]) }}</div>
         <div class="res-track"><div class="res-fill" :class="k" :style="{ width: resPct(k)+'%' }"></div></div>
       </div>
-      <button class="btn primary advance" :disabled="loading || s.status!=='running' || !!crisis" :title="crisis ? '请先处理当前危机' : ''" @click="advance">
-        {{ crisis ? '等待危机抉择' : loading ? '推进中…' : '推进一天' }}
+      <button class="btn primary advance" :disabled="loading || s.status!=='running' || !!crisis || expPending" :title="pendingTitle" @click="advance">
+        {{ crisis ? '等待危机抉择' : expPending ? '等待探索遭遇抉择' : loading ? '推进中…' : '推进一天' }}
       </button>
     </section>
     <div v-if="error" class="msg err global">{{ error }}</div>
@@ -136,6 +219,7 @@ window.GameView = {
       <nav class="tabs">
         <button :class="{ active: tab==='overview' }" @click="tab='overview'">总览</button>
         <button :class="{ active: tab==='residents' }" @click="tab='residents'">幸存者 ({{ alive.length }})</button>
+        <button :class="{ active: tab==='expedition' }" @click="tab='expedition'">探索队<template v-if="s.expedition"> ({{ s.expedition.members.length }})</template></button>
         <button :class="{ active: tab==='build' }" @click="tab='build'">设施扩建</button>
         <button :class="{ active: tab==='log' }" @click="tab='log'">大事记</button>
       </nav>
@@ -160,19 +244,47 @@ window.GameView = {
 
       <!-- 幸存者 -->
       <div v-if="tab==='residents'">
-        <div v-for="r in s.residents" :key="r.id" class="person" :class="{ dead: !r.alive }">
+        <div v-for="r in s.residents" :key="r.id" class="person" :class="{ dead: !r.alive, away: r.away }">
           <div class="p-avatar">{{ r.name[0] }}</div>
           <div class="p-info">
-            <div class="p-name">{{ r.name }} <span class="dim">{{ r.job_zh }}</span></div>
+            <div class="p-name">{{ r.name }} <span class="dim">{{ r.job_zh }}</span><span v-if="r.away" class="chip away-tag">探索中</span></div>
             <div class="meter"><i>健康</i><span class="track"><span class="fill" :style="{width: r.health+'%', background:'#4caf50'}"></span></span><b>{{ fmt(r.health) }}</b></div>
             <div class="meter"><i>士气</i><span class="track"><span class="fill" :style="{width: r.morale+'%', background:'#ffb300'}"></span></span><b>{{ fmt(r.morale) }}</b></div>
           </div>
           <div class="p-actions" v-if="r.alive && s.status==='running'">
-            <select :value="r.job" :disabled="!!crisis" @change="assignJob(r.id, $event.target.value)">
+            <select :value="r.job" :disabled="!!crisis || r.away" @change="assignJob(r.id, $event.target.value)">
               <option value="engineer">工程师</option>
               <option value="farmer">农民</option>
               <option value="general">杂工</option>
             </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- 探索队 -->
+      <div v-if="tab==='expedition'">
+        <!-- 无在外队伍：派遣 -->
+        <div v-if="!s.expedition" class="exp-panel">
+          <div class="exp-empty">
+            <p>派遣幸存者携带物资外出探索，途中可能遭遇事件，返程时统一结算战利品与伤亡。</p>
+            <p class="dim">离堡人员暂停地堡生产，不消耗地堡口粮；探索队消耗自带物资。</p>
+            <button class="btn primary" :disabled="s.status!=='running' || !!crisis" @click="openExpeditionDialog">派遣探索队</button>
+          </div>
+        </div>
+        <!-- 有在外队伍：状态 -->
+        <div v-else class="exp-panel">
+          <div class="exp-status">
+            <div class="exp-row"><span class="k">队员</span><span class="v">{{ expMemberNames() }}</span></div>
+            <div class="exp-row"><span class="k">行军</span><span class="v">第 {{ s.expedition.travel_days }} 天 / 上限 7 天</span></div>
+            <div class="exp-row"><span class="k">自带物资</span><span class="v">食物 {{ Math.round(s.expedition.supplies.food||0) }} · 水 {{ Math.round(s.expedition.supplies.water||0) }}</span></div>
+            <div class="exp-row"><span class="k">战利品（未结算）</span><span class="v loot">{{ expLootText() }}</span></div>
+            <div class="exp-row" v-if="s.expedition.encounters_resolved"><span class="k">已处理遭遇</span><span class="v">{{ s.expedition.encounters_resolved }} 次</span></div>
+          </div>
+          <div class="exp-actions">
+            <button class="btn primary" :disabled="s.status!=='running' || expPending" @click="returnExpedition">
+              {{ expPending ? '请先处理遭遇' : '立即返程' }}
+            </button>
+            <span class="dim" v-if="!expPending">返程时统一结算战利品与伤亡</span>
           </div>
         </div>
       </div>
@@ -226,6 +338,51 @@ window.GameView = {
             <span class="scope-tag" :class="{ solo: c.targeted }">{{ c.targeted ? '单人' : '全体' }}</span>
             <span class="hint">{{ c.hint }}</span>
           </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 探索遭遇弹层 -->
+    <div v-if="expPending" class="overlay">
+      <div class="crisis expedition">
+        <h2>🧭 {{ s.expedition.pending_encounter.title }}</h2>
+        <p class="crisis-desc">{{ s.expedition.pending_encounter.desc }}</p>
+        <div v-if="s.expedition.pending_encounter.needs_target" class="crisis-tgt">
+          相关队员：{{ s.expedition.pending_encounter.target_name }}<span class="dim">（仅标注「单人」的决策作用于本人，其余对全体队员生效）</span>
+        </div>
+        <div class="choices">
+          <button v-for="c in s.expedition.pending_encounter.choices" :key="c.key" class="choice" @click="resolveExpeditionEncounter(c)">
+            <strong>{{ c.label }}</strong>
+            <span class="scope-tag" :class="{ solo: c.targeted }">{{ c.targeted ? '单人' : '全体' }}</span>
+            <span class="hint">{{ c.hint }}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 派遣探索队弹层 -->
+    <div v-if="showExpeditionDialog" class="overlay">
+      <div class="crisis expedition">
+        <h2>派遣探索队</h2>
+        <p class="crisis-desc">选择在堡居民（最多 4 人）并分配自带物资。离堡人员暂停地堡生产，不消耗地堡口粮。</p>
+        <div class="exp-member-pick">
+          <div v-for="r in inBunkerAlive" :key="r.id" class="exp-member" :class="{ selected: expMembers.includes(r.id) }" @click="toggleMember(r.id)">
+            <span class="p-avatar">{{ r.name[0] }}</span>
+            <span>{{ r.name }}</span>
+            <span class="dim">{{ r.job_zh }}</span>
+          </div>
+          <div v-if="!inBunkerAlive.length" class="dim">没有可派遣的在堡居民</div>
+        </div>
+        <div class="exp-supplies">
+          <label>自带食物 <input type="number" min="0" v-model.number="expSupplies.food" /></label>
+          <label>自带饮水 <input type="number" min="0" v-model.number="expSupplies.water" /></label>
+          <span class="dim">每人每日消耗 1 食物 + 1 水</span>
+        </div>
+        <div class="choices">
+          <button class="choice primary-choice" @click="sendExpedition" :disabled="loading">
+            <strong>{{ loading ? '派遣中…' : '出发' }}</strong>
+          </button>
+          <button class="choice" @click="showExpeditionDialog=false"><strong>取消</strong></button>
         </div>
       </div>
     </div>
